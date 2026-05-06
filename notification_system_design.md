@@ -264,3 +264,122 @@ WHERE student_id = $1 AND is_read = FALSE;
 ```sql
 DELETE FROM notifications
 WHERE id = $1 AND student_id = $2;
+```
+
+---
+
+## Stage 3 — Slow Query Analysis
+
+### Is this query accurate?
+
+```sql
+SELECT FROM notifications
+WHERE student_id = 1042 AND isRead = false
+ORDER BY createdAt DESC;
+```
+
+No. `SELECT FROM` is missing the column list. It should be `SELECT *` (or explicit columns). Additionally, the column names `isRead` and `createdAt` use camelCase which does not match the schema — they should be `is_read` and `created_at`.
+
+**Corrected query:**
+```sql
+SELECT *
+FROM notifications
+WHERE student_id = 1042 AND is_read = FALSE
+ORDER BY created_at DESC;
+```
+
+---
+
+### Why is it slow?
+
+Without a composite index on `(student_id, is_read, created_at)`, PostgreSQL performs a sequential scan across all 5,000,000 rows to find those matching `student_id = 1042`. After filtering, it sorts the result set by `created_at DESC`, which requires a sort pass over all matching rows. At 5 million rows this scan is expensive even before the sort.
+
+---
+
+### What to change and the likely computation cost
+
+Add a composite index:
+
+```sql
+CREATE INDEX idx_notifications_student_read_date
+ON notifications (student_id, is_read, created_at DESC);
+```
+
+**Before index:** Full sequential scan — O(n) where n = 5,000,000 rows.
+
+**After index:** Index range scan on `student_id = 1042 AND is_read = FALSE`, then reads pre-sorted `created_at DESC` entries directly from the index. Cost drops to O(log n) for the lookup plus O(k) to read k matching rows for that student. For a student with 200 unread notifications, the engine reads ~200 rows instead of 5 million.
+
+---
+
+### Is indexing every column a good idea?
+
+No. Every index:
+- Slows down every INSERT, UPDATE, and DELETE because each write must update all indexes
+- Wastes disk space proportional to the table size multiplied by the number of indexes
+- Confuses the query planner — with many indexes it can choose suboptimal execution plans
+- Provides no benefit for columns that are never used in WHERE, JOIN, or ORDER BY clauses
+
+Indexes should be added surgically based on actual query patterns, not defensively on every column.
+
+---
+
+### Query to find all students who got a placement notification in the last 7 days
+
+```sql
+SELECT DISTINCT s.id, s.name, s.email
+FROM students s
+JOIN notifications n ON n.student_id = s.id
+WHERE n.notification_type = 'Placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days';
+  ```
+
+---
+## Stage 4 — Performance Under Load
+
+### Problem
+
+Every page load fires a direct database query. With 50,000 students potentially loading simultaneously, the database receives 50,000 concurrent read queries. This overwhelms connection pools and causes high latency or timeouts.
+
+---
+
+### Strategy 1 — Redis Caching per Student
+
+Cache the notification list for each student in Redis with a TTL of 60 seconds. On page load, check Redis first. Only query the database on a cache miss. When a new notification is created for a student, invalidate that student's cache key so the next load fetches fresh data.
+
+**Tradeoffs:**
+- Dramatically reduces database reads — 95%+ of page loads served from cache
+- Adds infrastructure complexity — Redis cluster must be managed and kept available
+- Stale data window — a student may see up to 60-second-old data between invalidations
+- Cache invalidation logic must be maintained correctly; missed invalidations cause stale reads
+
+---
+
+### Strategy 2 — Pagination (Cursor-Based)
+
+Instead of loading all notifications on each page load, load only the first 20. As the student scrolls, fetch the next page using a cursor (the `created_at` timestamp of the last seen notification).
+
+**Tradeoffs:**
+- Each query is bounded — fetching 20 rows is fast even without a cache
+- Reduces payload size — client receives only what is visible, not 500 notifications
+- Slightly more complex client logic for infinite scroll
+- Does not eliminate DB queries but makes each query cheap
+
+---
+
+### Strategy 3 — Background Pre-Computation
+
+A scheduled job (cron) runs every 30 seconds and pre-fetches and caches notifications for all students who have been active in the last 5 minutes. By the time an active student loads the page, their data is already in Redis.
+
+**Tradeoffs:**
+- Zero database hit at page load time for active students
+- Wasteful for inactive students — pre-computing cache entries for students who won't load the page wastes CPU and Redis memory
+- Adds operational complexity — cron job must be monitored and fault-tolerant
+
+---
+
+### Recommendation
+
+Combine all three: use pagination to bound query size, Redis to serve repeated loads without hitting the database, and background pre-computation to warm the cache for students who are actively using the platform. This gives low latency, bounded database load, and near-real-time freshness.
+
+---
+
