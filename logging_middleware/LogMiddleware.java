@@ -8,7 +8,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.HashMap;
 import java.util.Map;
-
+/**
+ * How did i implement? i did dseperate logging for both notifications and vehicle maintainance as both are seperate spring projects
+ */
 /**
  * Reusable logging middleware.
  * Sends structured log entries to the central evaluation log API.
