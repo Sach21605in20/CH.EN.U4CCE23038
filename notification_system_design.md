@@ -383,3 +383,136 @@ Combine all three: use pagination to bound query size, Redis to serve repeated l
 
 ---
 
+## Stage 5 — Reliable Bulk Notification
+
+### Shortcomings of the Proposed Implementation
+
+```
+function notify_all(student_ids: array, message: string):
+  for student_id in student_ids:
+    send_email(student_id, message)
+    save_to_db(student_id, message)
+    push_to_app(student_id, message)
+```
+
+1. **Sequential loop** — iterating over 50,000 students one at a time is extremely slow. Email delivery alone can take 100–500ms per call. 50,000 × 300ms = 4+ hours to complete.
+2. **No error isolation** — if `send_email` throws for one student, the loop halts and no subsequent students receive any notification.
+3. **No retry mechanism** — transient failures (network timeout, SMTP rate limit) silently drop notifications.
+4. **Tight coupling** — email, DB save, and in-app push are chained synchronously. A slow email provider blocks the DB write for every student.
+5. **No visibility** — there is no way to know which students received the notification and which did not.
+
+---
+
+### When 200 Emails Fail Midway
+
+Without per-student status tracking, there is no way to identify which 200 students did not receive the email. A re-run would resend to all 50,000, causing duplicates for the 49,800 who already received it. The correct response is to check the per-student status log, extract the 200 failed IDs, and retry only those entries.
+
+---
+
+### Should DB Save and Email Happen Together?
+
+No. DB save should happen first and independently. Once the notification is persisted, it is safe regardless of whether the email delivers. Email is a retriable side effect. If DB and email are coupled and the DB write succeeds but email fails, the state is ambiguous. If DB write is decoupled and done first, the notification exists in the system and can be re-sent at any time.
+
+---
+
+### Revised Pseudocode — Queue-Based Reliable Design
+
+```
+function notify_all(student_ids: array, message: string):
+  # Step 1: Persist all notifications to DB in batch (fast, atomic)
+  batch_save_to_db(student_ids, message, status="pending")
+
+  # Step 2: Enqueue one message per student into a message queue (Kafka/RabbitMQ)
+  for student_id in student_ids:
+    enqueue(queue="notification_jobs", payload={student_id, message})
+
+  # Step 3: Workers consume the queue in parallel
+  # Each worker processes one job:
+
+function worker_process(job):
+  student_id = job.student_id
+  message    = job.message
+
+  try:
+    send_email(student_id, message)
+    push_to_app(student_id, message)
+    update_db_status(student_id, message, status="delivered")
+  catch EmailFailure as e:
+    update_db_status(student_id, message, status="email_failed")
+    enqueue(queue="retry_jobs", payload=job, retry_count=job.retry_count+1)
+  catch AppPushFailure as e:
+    update_db_status(student_id, message, status="push_failed")
+
+  # Dead Letter Queue: after 3 retries, move to DLQ for manual review
+  if job.retry_count >= 3:
+    enqueue(queue="dead_letter", payload=job)
+    return
+```
+
+**Key properties of this design:**
+- DB write is decoupled and happens first in batch — fast and safe
+- Workers run in parallel — 50,000 notifications dispatched in seconds
+- Per-student status tracked — exact failure list available at any time
+- Retry logic is isolated — only failed students are retried
+- Dead letter queue captures persistent failures for manual review
+
+---
+
+## Stage 6 — Priority Inbox Implementation
+
+### Approach
+
+**Scoring Formula:**
+
+```
+priorityScore = (typeWeight × 10) + recencyScore
+```
+
+**Type weights:**
+- Placement = 3
+- Result = 2
+- Event = 1
+
+**Why multiply by 10:** This creates non-overlapping score tiers. Placement scores are 30–39, Result scores are 20–29, Event scores are 10–19. A very recent Event (score 19) can never outrank an old Placement (score 30). Type always dominates.
+
+**Recency score:**
+
+```
+recencyScore = max(0, 9 - hoursSinceCreation)
+```
+
+Clamped to [0, 9] to stay within the type tier. A notification created 0 hours ago scores 9 more points than one created 9+ hours ago within the same type.
+
+---
+
+### Why a Min-Heap
+
+A min-heap of fixed size 10 is the optimal data structure for tracking the top N items from a stream.
+
+- For each incoming notification: push it onto the heap — O(log 10) ≈ O(1)
+- If the heap exceeds size 10: pop the minimum — O(log 10) ≈ O(1)
+- After processing all N notifications: total time O(N log 10) ≈ O(N)
+
+This is more efficient than sorting all notifications (O(N log N)) or scanning for the maximum repeatedly (O(N × 10)).
+
+---
+
+### Handling New Incoming Notifications
+
+When a new notification arrives after the initial top-10 is built, compare its `priorityScore` against the current minimum in the heap:
+
+```
+function handle_new_notification(notification):
+  score = compute_priority_score(notification)
+  if heap.size() < 10:
+    heap.push(notification)
+  elif score > heap.peek_min().priorityScore:
+    heap.pop()        # remove current lowest
+    heap.push(notification)  # insert new higher-priority notification
+  # else: new notification does not rank in top 10, ignore
+```
+
+This maintains the top-10 at O(log 10) per new notification — effectively constant time regardless of total notification volume.
+
+---
+
