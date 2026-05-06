@@ -80,8 +80,6 @@ public class VehicleLogRunner {
         // Small wait to let the async HTTP call dispatch before the JVM exits
         Thread.sleep(1500);
 
-        saveProgress(index + 1);
-
         int remaining = LOGS.size() - (index + 1);
         if (remaining > 0) {
             System.out.println("Done. " + remaining + " logs remaining. Run again to send next.");
@@ -96,9 +94,5 @@ public class VehicleLogRunner {
         } catch (Exception e) {
             return 0;
         }
-    }
-
-    private static void saveProgress(int nextIndex) throws IOException {
-        Files.writeString(Path.of(PROGRESS_FILE), String.valueOf(nextIndex));
     }
 }
