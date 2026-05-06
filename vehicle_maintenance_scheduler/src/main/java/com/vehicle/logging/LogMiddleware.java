@@ -1,4 +1,4 @@
-package com.vehicle.vehicle_maintenance_scheduler.logging;
+package com.vehicle.logging;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
